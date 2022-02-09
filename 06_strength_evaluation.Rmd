@@ -1,0 +1,203 @@
+---
+title: "05_classification_evaluation.Rmd"
+author: "Jack VanSchaik"
+date: "2/9/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(tidyverse)
+library(torch)
+```
+
+## Create Evaluation Dataset
+
+First, causenet pairs should be loaded in:
+
+```{r}
+cn_count <- read.csv("data_out/causenet_with_counts.csv")
+vocab <- sort(unique(c(cn_count$cause, cn_count$effect)))
+
+M <- matrix(NA_character_, nrow = 2, ncol = sum(cn_count$count))
+j <- 1
+for (i in 1:nrow(cn_count)) {
+    r <- cn_count[i,3]
+    M[,j:(j+r-1)] <- as.character(cn_count[i,1:2])
+    j <- j + r
+}
+
+M <- t(M)
+
+set.seed(4328904)
+Sample_Size <- 50000 # number of samples, a parameter
+M_s <- M[sample(nrow(M), Sample_Size, replace = TRUE),]
+df_s <- setNames(as.data.frame(M_s), c("cause", "effect"))
+
+set.seed(3192300)
+
+matrix(sample(vocab, 100000 * 2, replace = TRUE), nrow = 100000, ncol = 2) %>%
+    as.data.frame %>%
+    setNames(c("cause", "effect")) %>%
+    anti_join(cn_count, by=c("cause", "effect")) %>%
+    sample_n(50000) ->
+    df_n
+
+df_eval <-
+    rbind(
+        mutate(df_s, causal_pair = 1),
+        mutate(df_n, causal_pair = 0)
+    )
+
+count(df_eval, causal_pair)
+```
+
+## Evaluation Function
+
+```{r}
+eval <- function(pred, actl) {
+    tp <- sum((actl == 1) & (pred == 1))
+    tn <- sum((actl == 0) & (pred == 0))
+    fp <- sum((actl == 0) & (pred == 1))
+    fn <- sum((actl == 1) & (pred == 0))
+    prec <- tp/(tp + fp)
+    rcll <- tp/(tp + fn)
+    accu <- (tp + tn)/(tp + tn + fp + fn)
+    spec <- tn/(tn + fp)
+    f1   <- 2*tp/(2*tp + fp + fn)
+    
+    df <- data.frame(f1 = f1, precision = prec, recall = rcll, spec = spec, accuracy = accu)
+    mutate_all(df, round, 3)
+}
+```
+
+## Evaluation 0: Noise
+
+```{r}
+set.seed(92034233)
+actl <- df_eval$causal_pair
+pred <- sample(c(0,1), length(actl), replace = TRUE)
+eval(pred, actl)
+```
+
+## Evaluation 1: Cause2Effect-NLL
+
+```{r}
+L <- readRDS("matrices/cn_ce_100_2.rds")
+
+M_c <- L$M_c
+M_e <- L$M_e
+
+Vocab <- as.environment(setNames(as.list(seq(vocab)), vocab))
+
+pcis <- unlist(map2(df_eval$cause, df_eval$effect, function(x, y) {
+    i <- Vocab[[x]]
+    j <- Vocab[[y]]
+    C_i <- M_c[i]
+    E_j <- M_e[j]
+    as.numeric(C_i %*% E_j)
+}))
+
+df_score <- mutate(df_eval, pci=pcis)
+log_reg <- glm(causal_pair ~ pci, family = "binomial", data = df_score)
+pred <- as.integer(predict(log_reg) > 0)
+actl <- df_score$causal_pair
+
+eval(pred, actl) # 0.456
+```
+
+## Evaluation 2: Cause2Effect-SGNS
+
+
+```{r}
+library(reticulate)
+
+gensim <- import("gensim")
+
+w2v <- gensim$models$Word2Vec$load("scratch/word2vec.model")
+cv  <- w2v$wv$vectors
+ev  <- w2v$syn1neg
+
+vocab     <- lapply(as.list(w2v$wv$vocab), `[[`, "index")
+w2v_vocab <- names(vocab)[order(as.integer(vocab))]
+V         <- as.environment(setNames(as.list(seq(w2v_vocab)), w2v_vocab))
+
+pcis <- rep(NA, nrow(df_eval))
+for (i in seq(pcis)) {
+    c_j <- V[[df_eval$cause[i]]]
+    e_j <- V[[df_eval$effect[i]]]
+    v_c <- cv[c_j,]
+    v_e <- ev[e_j,]
+    pcis[i] <- as.numeric(v_c %*% v_e)
+}
+
+df_eval$pci <- pcis
+
+log_reg <- glm(causal_pair ~ pci, family = "binomial", data = df_eval)
+pred <- as.integer(predict(log_reg) > 0)
+actl <- df_eval$causal_pair
+
+eval(pred, actl)
+```
+
+## Evaluation 3: Cause2Effect-SGNS Unseen Only
+
+Repeat the above, but only use unseen pairs
+
+```{r}
+set.seed(23423)
+
+seen <- read_csv("data_out/cause_net_1M.csv")
+
+seen %>%
+    select(cause, effect) %>%
+    distinct %>%
+    anti_join(df_eval, ., by=c("cause", "effect")) ->
+    unseen_1
+
+N <- sum(unseen_1$causal_pair)
+
+unseen_1 %>%
+    group_by(causal_pair) %>%
+    sample_n(N) ->
+    eval_df_unseen
+
+log_reg <- glm(causal_pair ~ pci, family = "binomial", data = eval_df_unseen)
+pred <- as.integer(predict(log_reg) > 0)
+actl <- eval_df_unseen$causal_pair
+
+eval(pred, actl)
+```
+
+```{r}
+count(unseen_1, causal_pair)
+```
+
+## Qualitative
+
+```{r}
+eval_df_unseen$pred <- pred
+
+eval_df_unseen %>%
+    filter(causal_pair == 1 & pred == 1) %>%
+    arrange(pci) %>%
+    mutate(pci = pci*-1) %>%
+    select(cause, effect, pci) %>%
+    mutate(rank = row_number())
+```
+
+```{r}
+eval_df_unseen %>%
+    filter(causal_pair == 1 & pred == 1) %>%
+    arrange(pci) %>%
+    mutate(pci = pci*-1) %>%
+    select(cause, effect, pci) %>%
+    mutate(rank = row_number()) %>%
+    tail(n = 10) %>%
+    mutate(pci = round(pci, 3))
+```
+

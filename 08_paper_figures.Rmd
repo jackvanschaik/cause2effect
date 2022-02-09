@@ -1,0 +1,161 @@
+---
+title: "40_pci_exploration.Rmd"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Data
+
+```{r}
+library(tidyverse)
+cn <- read_csv("data_out/causenet_with_counts.csv")
+nodes <- readRDS("scratch/causenet_nodes.rds")
+```
+
+## Counts
+
+Before filtering
+
+```{r}
+nrow(nodes)
+sum(nodes$count)
+```
+
+After filtering
+
+```{r}
+nrow(cn)
+sum(cn$count)
+```
+
+
+## Calculate PCI
+
+```{r}
+N <- sum(cn$count)
+
+cn %>%
+    group_by(cause) %>%
+    summarise(cause_count = sum(count)) %>%
+    ungroup ->
+    cn_cause
+
+cn %>%
+    group_by(effect) %>%
+    summarise(effect_count = sum(count)) %>%
+    ungroup ->
+    cn_effect
+
+cn %>%
+    inner_join(cn_cause, by = "cause") %>%
+    inner_join(cn_effect, by= "effect") %>%
+    mutate(pci = log((N*count)/(cause_count * effect_count))) ->
+    pci
+
+tail(pci)
+```
+
+"uninteresting" pairs
+
+```{r}
+set.seed(12341234)
+
+pci %>%
+    filter(count == 2) %>%
+    filter(cause_count == 2) %>%
+    filter(effect_count == 2) %>%
+    sample_n(10)
+```
+
+
+```{r}
+pci %>%
+    arrange(desc(pci)) %>%
+    filter(count != cause_count) %>%
+    filter(count != effect_count) %>%
+    filter(count >= 25)
+```
+
+```{r}
+pci %>%
+    arrange(desc(pci)) %>%
+    filter(pci <= 11)
+```
+
+
+```{r}
+hist(pci$pci, breaks=100)
+```
+
+```{r}
+pci %>%
+    mutate(Count = if_else(count < 10, "< 10", ">= 10")) %>%
+    ggplot(aes(x = pci, group = Count, color = Count)) + 
+        geom_density(kernel = "gaussian", size = 2) +
+        theme_minimal()
+```
+
+```{r}
+pci %>%
+    filter(count >= 10) %>%
+    ggplot(aes(x = pci)) + 
+        geom_density(kernel = "gaussian", size = 2) +
+        theme_minimal() +
+        geom_vline(xintercept = c(-1.5, 0, 2, 5, 10), linetype = "dashed", size = 1) +
+        labs(x = "PCI", y = "Density")
+```
+
+```{r}
+pci %>%
+    filter(count >= 10) %>%
+    arrange(desc(pci))
+```
+
+```{r}
+pci %>%
+    filter(count >= 10) %>%
+    filter(pci <= 10) %>%
+    arrange(desc(pci)) %>%
+    transmute(cause, effect, pci = round(pci, 3)) %>% 
+    head(5)
+```
+
+```{r}
+pci %>%
+    filter(count >= 10) %>%
+    filter(pci <= 5) %>%
+    arrange(desc(pci)) %>%
+    transmute(cause, effect, pci = round(pci, 3)) %>% 
+    head(5)
+```
+
+```{r}
+pci %>%
+    filter(count >= 10) %>%
+    filter(pci <= 2) %>%
+    arrange(desc(pci)) %>%
+    transmute(cause, effect, pci = round(pci, 3)) %>% 
+    head(5)
+```
+
+```{r}
+pci %>%
+    filter(count >= 10) %>%
+    filter(pci <= 0) %>%
+    arrange(desc(pci)) %>%
+    transmute(cause, effect, pci = round(pci, 3)) %>% 
+    head(5)
+```
+
+```{r}
+pci %>%
+    filter(count >= 10) %>%
+    filter(pci <= -1.5) %>%
+    arrange(desc(pci)) %>%
+    transmute(cause, effect, pci = round(pci, 3)) %>% 
+    head(5)
+```
+

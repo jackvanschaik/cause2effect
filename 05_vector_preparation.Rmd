@@ -1,0 +1,201 @@
+---
+title: "03_vector_preparation.Rmd"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+```
+
+
+## Save pretrained word2vec vetors
+
+```{python}
+import gensim.downloader
+import sqlite3
+import json
+
+# Get Unique Tokens from Semeval
+con = sqlite3.connect("sqlite/semeval_normal.sqlite")
+cur = con.cursor()
+res = cur.execute("SELECT DISTINCT token FROM ent_simple ORDER BY token").fetchall()
+con.close()
+vocab = [x[0] for x in res]
+
+# Get Coverage For Different Models
+model = gensim.downloader.load('word2vec-google-news-300')
+vctrs = {}
+n = 0
+m = 0
+for t in vocab:
+    n += 1
+    try:
+        vec = model[t]
+        m += 1
+    except KeyError:
+        vec = []
+pct_w2v = m/n
+print(pct_w2v)
+
+import gensim.downloader
+model = gensim.downloader.load('word2vec-google-news-300')
+vector = model["word"]
+
+
+# Get Embeddings for Each Token
+
+vctrs[t] = vec
+
+# Save
+with open('embeddings/w2v.json', 'w') as f:
+    json.dump(vctrs, f)
+```
+
+```{r}
+library(DBI)
+con <- dbConnect(RSQLite::SQLite(), "sqlite/semeval_normal.sqlite")
+ent_lem_pos <- dbReadTable(con, "ent_lem_pos")
+ent_simple <- dbReadTable(con, "ent_simple")
+dbDisconnect(con)
+
+ent_simple %>%
+    select(-label) %>%
+    rename(token_simple = token) %>%
+    inner_join(ent_lem_pos) %>%
+    select(-label) %>%
+    rename(token_lem = token) %>%
+    select(token_simple, token_lem) %>%
+    distinct %>%
+    filter(token_simple != token_lem) %>%
+    arrange(token_simple) ->
+    token_map
+    
+token_map %>%
+    group_by(token_simple) %>%
+    summarise(n_lemmas =  length(token_lem)) %>%
+    ungroup %>%
+    count(n_lemmas)
+
+library(purrr)
+
+w2v <- jsonlite::read_json("embeddings/w2v.json")
+L <- lapply(w2v, function(x) unlist(x))
+L_c <- compact(L)
+oth <- setdiff(names(L), names(L_c))
+cn <- c("token", paste0("w2v", 1:300))
+df1 <- as.data.frame(t(as.data.frame(L_c)))
+df2 <- setNames(cbind(data.frame(token = names(L_c)), df1), cn)
+
+token_map %>%
+    rename(token = token_lem) %>%
+    inner_join(df2, by = "token") %>%
+    select(-token) %>%
+    rename(token = token_simple)
+
+df2
+
+w2v_df <- rbind(
+    setNames(cbind(data.frame(token = names(L_c)), df1), cn),
+    setNames(cbind(data.frame(token = oth), df2), cn)
+)
+
+saveRDS(w2v_df, "embeddings/word2vec_300.rds")
+readr::write_csv(w2v_df, "embeddings/word2vec_300.csv")
+```
+
+
+## Create Dense PCI Vectors Using PCA
+
+```{r}
+nodes_slim <- read_csv("data_out/causenet_with_counts.csv")
+
+nodes_slim %>%
+    group_by(cause) %>%
+    summarize(cause_count = sum(count)) %>%
+    ungroup ->
+    nodes_cause
+
+nodes_slim %>%
+    group_by(effect) %>%
+    summarize(effect_count = sum(count)) %>%
+    ungroup ->
+    nodes_effect
+
+N_pairs <- as.numeric(sum(nodes_slim$count))
+
+nodes_slim %>%
+    left_join(nodes_cause, by = "cause") %>%
+    left_join(nodes_effect, by = "effect") %>%
+    mutate(pci = log((count * N_pairs)/(cause_count*effect_count))) %>%
+    mutate(
+        cause = as.character(cause),
+        effect = as.character(effect)
+    ) ->
+    nodes_pci
+
+library(irlba)
+library(Matrix)
+
+entities <- sort(unique(c(nodes_pci$cause, nodes_pci$effect)))
+ent_map <- data.frame(entity = entities, id = seq(entities))
+nodes_pci %>%
+    mutate(entity = cause) %>%
+    left_join(ent_map, by = "entity") %>%
+    rename(m_i = id) %>%
+    mutate(entity = effect) %>%
+    left_join(ent_map, by = "entity") %>%
+    transmute(
+        m_i = m_i,
+        m_j = id,
+        pci = pci
+    ) ->
+    pci_sparse_df
+
+saveRDS(pci_sparse_df, "scratch/pci_sparse_df.rds")
+saveRDS(ent_map, "scratch/pci_ent_map.rds")
+
+pci_sparse_df <- readRDS("scratch/pci_sparse_df.rds")
+ent_map <- readRDS("scratch/pci_ent_map.rds")
+
+pci_sparse_Matrix <- sparseMatrix(
+    i = pci_sparse_df$m_i,
+    j = pci_sparse_df$m_j,
+    x = pci_sparse_df$pci
+)
+
+pci_sparse_Matrix_t <- sparseMatrix(
+    i = pci_sparse_df$m_j,
+    j = pci_sparse_df$m_i,
+    x = pci_sparse_df$pci
+)
+
+pca <- prcomp_irlba(pci_sparse_Matrix, n = 50)
+pca_t <- prcomp_irlba(pci_sparse_Matrix_t, n = 50)
+
+names(pca)
+dim(pca$rotation)
+
+cause_emb  <- cbind(ent_map, as.data.frame(pca$x))
+effect_emb <- cbind(ent_map[1:(nrow(ent_map) - 5),], as.data.frame(pca_t$x))
+
+saveRDS(cause_emb, file="embeddings/causenet_cause_50.rds")
+saveRDS(effect_emb, file="embeddings/causenet_effect_50.rds")
+cn_cause <- readRDS("embeddings/causenet_cause_50.rds")
+cn_effect <- readRDS("embeddings/causenet_effect_50.rds")
+
+names(cn_cause) <- c("token", "token_id", paste0("cnc", 1:50))
+names(cn_effect) <- c("token", "token_id", paste0("cne", 1:50))
+
+cn_cause %>%
+    select(-token_id) %>%
+    inner_join(cn_effect, by="token") %>%
+    select(-token_id) ->
+    ce_pci_df
+
+saveRDS(ce_pci_df, "embeddings/pci_ce_100.rds")
+readr::write_csv(ce_pci_df, "embeddings/pci_ce_100.csv")
+```

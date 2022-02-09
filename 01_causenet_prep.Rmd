@@ -1,0 +1,120 @@
+---
+title: "01_causenet_prep.Rmd"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+```
+
+## Parse CauseNet
+
+Need to specify the location of the extracted CauseNet data. Data can be downloaded from CauseNet.org.
+
+```{r}
+library(tidyverse)
+library(jsonparse)
+
+in_file <- "/home/jtvansch/data/causenet/causenet-full.jsonl"
+cn_full <- readLines(in_file)
+
+line_to_pair <- function(X) {
+    json <- from_json(X)
+    cause <- json$causal_relation$cause$concept
+    effect <- json$causal_relation$effect$concept
+    n_evidence <- length(json$sources)
+    c(cause, effect, n_evidence)
+}
+
+N <- length(cn_full)
+k <- 10000
+L <- ceiling(N/k)
+
+for (j in 1:L) {
+    print(j/L)
+    start <- 1 + (j - 1)*k
+    end <- min(c(j*k, N))
+    X <- lapply(cn_full[start:end], line_to_pair)
+    saveRDS(X, paste0("scratch/", j, ".rds"), compress = FALSE)
+}
+
+
+# compile
+
+lf <- list.files("scratch", full.names = TRUE, pattern = "rds")
+Z_ <- lapply(lf, readRDS)
+w_ <- do.call(c, Z_)
+
+c1 <- unlist(lapply(w_, `[`, 1))
+c2 <- unlist(lapply(w_, `[`, 2))
+c3 <- as.integer(unlist(lapply(w_, `[`, 3)))
+df <- data.frame(cause = c1, effect = c2, count = c3)
+
+system("rm scratch/*")
+saveRDS(df, "scratch/causenet_nodes.rds")
+
+```
+
+## Create Filtered CauseNet Subsets
+
+Deserialize
+
+```{r}
+nodes <- readRDS("scratch/causenet_nodes.rds")
+```
+
+Do some filtering
+
+* Pairs with less than one count are considered noise
+* single word alphabet characters only
+
+```{r}
+nodes %>%
+    filter(count > 1) %>%
+    filter(str_detect(cause, "^[[:alpha:]]+$")) %>%
+    filter(str_detect(effect, "^[[:alpha:]]+$")) ->
+    nodes_slim
+```
+
+
+## Create Sampled Files
+
+```{r}
+write_csv(nodes_slim, "data_out/causenet_with_counts.csv")
+```
+
+Read back in to for ascii
+
+```{r}
+cn_count <- read_csv("data_out/causenet_with_counts.csv")
+```
+
+```{r}
+# Expand for easy sampling
+M <- matrix(NA_character_, nrow = 2, ncol = sum(cn_count$count))
+j <- 1
+for (i in 1:nrow(cn_count)) {
+    r <- as.integer(cn_count[i,3])
+    M[,j:(j+r-1)] <- as.character(cn_count[i,1:2])
+    j <- j + r
+}
+
+M <- t(M)
+
+# Create a representative sample
+set.seed(239874374)
+Sample_Size <- 1000000 # number of samples, a parameter
+M_s <- M[sample(nrow(M), Sample_Size, replace = TRUE),]
+```
+
+```{r}
+M_s %>%
+    as.data.frame %>%
+    setNames(c("cause", "effect")) %>%
+    write_csv("data_out/cause_net_1M.csv")
+```
+
