@@ -27,7 +27,7 @@ Code for preparing pretrained word2vec vectors and PCA based vectors
 
 PCI* strength evaluation via binary classification task and qualitative evaluation
 
-## `07_vector_evaluation...`
+## `07_vector_evaluation`
 
 Code for downstream evaluation task on SemEval
 
